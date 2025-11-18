@@ -1,6 +1,10 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Mic, MicOff, Shield, MapPin, Zap, Brain, Phone, LogIn, Mail, Lock, Eye, EyeOff, X, User } from 'lucide-react';
 import { GridScan } from './Gridscan.jsx';
+import VolunteerDashboard from './VolunteerDashboard.jsx';
+import { API_CONFIG, VOLUNTEER_CREDENTIALS } from './config.js';
+import { auth, saveNotificationToFirestore } from './firebase.js';
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut } from 'firebase/auth';
 
 // Google Icon SVG Component
 const GoogleIcon = ({ className }) => (
@@ -15,6 +19,7 @@ const GoogleIcon = ({ className }) => (
 function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [user, setUser] = useState(null);
+  const [isVolunteer, setIsVolunteer] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [loginForm, setLoginForm] = useState({
     email: '',
@@ -29,9 +34,22 @@ function App() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+
   const [loginError, setLoginError] = useState('');
   const [signUpError, setSignUpError] = useState('');
   const [showSignUp, setShowSignUp] = useState(false);
+
+  // Recording and voice activation states
+  const [isListening, setIsListening] = useState(false);
+  const [recordingStatus, setRecordingStatus] = useState('idle'); // idle, listening, recording, processing
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const silenceTimerRef = useRef(null);
+  const recordingStartTimeRef = useRef(null);
+  const geminiWebSocketRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const locationRef = useRef(null);
 
   // Open login modal
   const handleLoginClick = () => {
@@ -73,7 +91,298 @@ function App() {
     if (signUpError) setSignUpError('');
   };
 
-  // Placeholder function for API integration - handles login form submission
+  // Get user's current location
+  const getCurrentLocation = () => {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error('Geolocation is not supported by your browser'));
+        return;
+      }
+
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const location = {
+            coordinates: {
+              lat: position.coords.latitude,
+              lng: position.coords.longitude
+            },
+            address: `${position.coords.latitude.toFixed(6)}, ${position.coords.longitude.toFixed(6)}`,
+            mapUrl: `https://www.google.com/maps?q=${position.coords.latitude},${position.coords.longitude}`
+          };
+          locationRef.current = location;
+          resolve(location);
+        },
+        (error) => {
+          console.error('Error getting location:', error);
+          reject(error);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0
+        }
+      );
+    });
+  };
+
+  // Send notification to volunteer dashboard (using Firestore)
+  const sendNotificationToDashboard = async (audioBlob, transcription, location) => {
+    try {
+      const userId = user?.uid || user?.id || 'anonymous';
+      await saveNotificationToFirestore(audioBlob, transcription, location, userId);
+      console.log('Notification sent to Firestore');
+    } catch (error) {
+      console.error('Error sending notification:', error);
+      // Fallback handled in firebase.js
+    }
+  };
+
+  // Detect silence in audio stream
+  const detectSilence = (analyser, threshold = 30, duration = 15000) => {
+    return new Promise((resolve) => {
+      let silenceStartTime = null;
+      let animationFrameId = null;
+      
+      const checkSilence = () => {
+        if (recordingStatus !== 'recording') {
+          if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+          }
+          if (silenceTimerRef.current) {
+            clearTimeout(silenceTimerRef.current);
+            silenceTimerRef.current = null;
+          }
+          return;
+        }
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        analyser.getByteFrequencyData(dataArray);
+        
+        const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+        
+        if (average < threshold) {
+          // Sound is below threshold (silence detected)
+          if (silenceStartTime === null) {
+            silenceStartTime = Date.now();
+          } else {
+            const silenceDuration = Date.now() - silenceStartTime;
+            if (silenceDuration >= duration) {
+              // 15 seconds of silence detected
+              if (animationFrameId) {
+                cancelAnimationFrame(animationFrameId);
+              }
+              resolve(true);
+              return;
+            }
+          }
+        } else {
+          // Sound detected, reset silence timer
+          silenceStartTime = null;
+        }
+        
+        animationFrameId = requestAnimationFrame(checkSilence);
+      };
+      
+      animationFrameId = requestAnimationFrame(checkSilence);
+    });
+  };
+
+  // Start recording with silence detection
+  const startRecordingWithSilenceDetection = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Set up audio context for silence detection
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      source.connect(analyserRef.current);
+
+      // Set up MediaRecorder
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        
+        // Get location
+        let location = null;
+        try {
+          location = await getCurrentLocation();
+        } catch (error) {
+          console.error('Failed to get location:', error);
+        }
+
+        // Send notification to dashboard
+        await sendNotificationToDashboard(audioBlob, 'Transcription from recording', location);
+
+        // Stop all tracks
+        stream.getTracks().forEach(track => track.stop());
+        if (audioContextRef.current) {
+          audioContextRef.current.close();
+        }
+
+        setRecordingStatus('idle');
+        setIsRecording(false);
+        alert('Recording sent to volunteers!');
+        
+        // Restart voice activation automatically after recording
+        setTimeout(() => {
+          if (!isRecording && !isListening && user && !isVolunteer) {
+            console.log('Restarting voice activation after recording...');
+            initializeGeminiVoiceActivation();
+          }
+        }, 1000);
+      };
+
+      recordingStartTimeRef.current = Date.now();
+      mediaRecorder.start();
+      setRecordingStatus('recording');
+      setIsRecording(true);
+
+      // Check for 30 second maximum
+      setTimeout(() => {
+        if (mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        }
+      }, 30000);
+
+      // Start silence detection
+      detectSilence(analyserRef.current).then(() => {
+        if (mediaRecorder.state === 'recording') {
+          mediaRecorder.stop();
+        }
+      });
+
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      setRecordingStatus('idle');
+      setIsRecording(false);
+      alert('Error accessing microphone. Please check permissions.');
+    }
+  };
+
+  // Check if transcript contains any trigger phrase from config
+  const checkTriggerPhrases = (transcript) => {
+    const lowerTranscript = transcript.toLowerCase();
+    return API_CONFIG.TRIGGER_PHRASES.some(phrase => 
+      lowerTranscript.includes(phrase.toLowerCase())
+    );
+  };
+
+  // Initialize voice activation (uses Web Speech API, Gemini API key optional)
+  const initializeGeminiVoiceActivation = async () => {
+    // Don't start if already listening or recording
+    if (isListening || isRecording || recordingStatus === 'recording') {
+      return;
+    }
+
+    try {
+      // Request microphone permission
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      
+      // Set up audio context
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 256;
+      source.connect(analyserRef.current);
+
+      // Connect to Gemini Live API
+      // Note: This is a simplified implementation. Actual Gemini Live API may require different setup
+      const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService/BidiGenerateContent?key=${API_CONFIG.GEMINI_API_KEY}`;
+      
+      // For now, we'll use a simpler approach with Web Speech API as fallback
+      // and implement Gemini Live when API key is provided
+      if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const recognition = new SpeechRecognition();
+        recognition.continuous = true;
+        recognition.interimResults = true; // Enable for faster detection
+        recognition.lang = 'en-US';
+
+        recognition.onresult = (event) => {
+          // Check all results including interim ones
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript.toLowerCase();
+            
+            // Check if any trigger phrase from config is detected
+            if (checkTriggerPhrases(transcript)) {
+              console.log('Trigger phrase detected:', transcript);
+              recognition.stop();
+              setIsListening(false);
+              setRecordingStatus('recording');
+              startRecordingWithSilenceDetection();
+              return;
+            }
+          }
+        };
+
+        recognition.onerror = (event) => {
+          console.error('Speech recognition error:', event.error);
+          // Auto-restart on certain errors
+          if (event.error !== 'aborted' && event.error !== 'no-speech') {
+            setTimeout(() => {
+              if (!isRecording && !isListening && user && !isVolunteer) {
+                console.log('Restarting voice activation after error...');
+                initializeGeminiVoiceActivation();
+              }
+            }, 1000);
+          }
+        };
+
+        recognition.onend = () => {
+          // Auto-restart listening when recognition ends (unless we're recording)
+          if (!isRecording && recordingStatus !== 'recording') {
+            console.log('Restarting voice activation...');
+            setIsListening(false);
+            setTimeout(() => {
+              if (!isRecording && !isListening && user && !isVolunteer) {
+                initializeGeminiVoiceActivation();
+              }
+            }, 500);
+          }
+        };
+
+        recognition.start();
+        setIsListening(true);
+        setRecordingStatus('listening');
+        console.log('Voice activation started. Listening for:', API_CONFIG.TRIGGER_PHRASES);
+        
+        // Store recognition instance for cleanup
+        geminiWebSocketRef.current = recognition;
+      } else {
+        console.warn('Speech recognition not supported. Please use Chrome or Edge browser.');
+      }
+
+    } catch (error) {
+      console.error('Error initializing voice activation:', error);
+    }
+  };
+
+  // Stop voice activation
+  const stopVoiceActivation = () => {
+    if (geminiWebSocketRef.current) {
+      if (geminiWebSocketRef.current.stop) {
+        geminiWebSocketRef.current.stop();
+      }
+      geminiWebSocketRef.current = null;
+    }
+    setIsListening(false);
+    setRecordingStatus('idle');
+  };
+
+  // Handle login with Firebase Authentication
   const handleLogin = async (e) => {
     e.preventDefault();
     setLoginError('');
@@ -98,33 +407,76 @@ function App() {
 
     setIsLoading(true);
     
-    // TODO: Replace with actual API call
-    // Example: const response = await fetch('/api/login', { 
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify({ email: loginForm.email, password: loginForm.password })
-    // });
-    console.log('Login attempt - API integration needed', loginForm);
+    // Check if volunteer credentials (fallback if Firebase not configured)
+    if (loginForm.email === VOLUNTEER_CREDENTIALS.email && 
+        loginForm.password === VOLUNTEER_CREDENTIALS.password) {
+      // Volunteer login - redirect to dashboard
+      setUser({
+        id: 'volunteer_1',
+        uid: 'volunteer_1',
+        name: 'Volunteer',
+        email: loginForm.email,
+        isVolunteer: true
+      });
+      setIsVolunteer(true);
+      setIsLoading(false);
+      setShowLoginModal(false);
+      setLoginForm({ email: '', password: '' });
+      return;
+    }
     
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    // Simulate successful login (in real app, check response)
-    setUser({
-      id: '1',
-      name: 'User',
-      email: loginForm.email
-    });
-    
-    setIsLoading(false);
-    setShowLoginModal(false);
-    setLoginForm({ email: '', password: '' });
-    
-    // Success message could be shown here
-    console.log('Login successful!');
+    // Firebase Authentication
+    if (auth) {
+      try {
+        const userCredential = await signInWithEmailAndPassword(
+          auth,
+          loginForm.email,
+          loginForm.password
+        );
+        
+        const firebaseUser = userCredential.user;
+        setUser({
+          id: firebaseUser.uid,
+          uid: firebaseUser.uid,
+          name: firebaseUser.displayName || 'User',
+          email: firebaseUser.email,
+          isVolunteer: false
+        });
+        
+        setIsLoading(false);
+        setShowLoginModal(false);
+        setLoginForm({ email: '', password: '' });
+        console.log('Firebase login successful!');
+      } catch (error) {
+        setIsLoading(false);
+        console.error('Firebase login error:', error);
+        
+        // Handle specific Firebase errors
+        switch (error.code) {
+          case 'auth/user-not-found':
+            setLoginError('No account found with this email');
+            break;
+          case 'auth/wrong-password':
+            setLoginError('Incorrect password');
+            break;
+          case 'auth/invalid-email':
+            setLoginError('Invalid email address');
+            break;
+          case 'auth/too-many-requests':
+            setLoginError('Too many failed attempts. Please try again later');
+            break;
+          default:
+            setLoginError('Login failed. Please try again');
+        }
+      }
+    } else {
+      // Fallback if Firebase not configured
+      setIsLoading(false);
+      setLoginError('Firebase not configured. Please check your configuration.');
+    }
   };
 
-  // Placeholder function for Sign Up
+  // Handle sign up with Firebase Authentication
   const handleSignUp = async (e) => {
     e.preventDefault();
     setSignUpError('');
@@ -171,75 +523,81 @@ function App() {
 
     setIsLoading(true);
     
-    // TODO: Replace with actual API call
-    // Example: const response = await fetch('/api/signup', { 
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify({ 
-    //     email: signUpForm.email, 
-    //     password: signUpForm.password,
-    //     phoneNumber: signUpForm.phoneNumber
-    //   })
-    // });
-    console.log('Sign up attempt - API integration needed', signUpForm);
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    
-    // Simulate successful sign up (in real app, check response)
-    setUser({
-      id: '1',
-      name: 'User',
-      email: signUpForm.email,
-      phoneNumber: signUpForm.phoneNumber
-    });
-    
-    setIsLoading(false);
-    setShowLoginModal(false);
-    setSignUpForm({ email: '', password: '', confirmPassword: '', phoneNumber: '' });
-    
-    // Success message could be shown here
-    console.log('Sign up successful!');
+    // Firebase Authentication
+    if (auth) {
+      try {
+        const userCredential = await createUserWithEmailAndPassword(
+          auth,
+          signUpForm.email,
+          signUpForm.password
+        );
+        
+        const firebaseUser = userCredential.user;
+        
+        // TODO: Save phone number to Firestore user document
+        // await updateProfile(firebaseUser, { phoneNumber: signUpForm.phoneNumber });
+        
+        setUser({
+          id: firebaseUser.uid,
+          uid: firebaseUser.uid,
+          name: firebaseUser.displayName || 'User',
+          email: firebaseUser.email,
+          phoneNumber: signUpForm.phoneNumber
+        });
+        
+        setIsLoading(false);
+        setShowLoginModal(false);
+        setSignUpForm({ email: '', password: '', confirmPassword: '', phoneNumber: '' });
+        console.log('Firebase sign up successful!');
+      } catch (error) {
+        setIsLoading(false);
+        console.error('Firebase sign up error:', error);
+        
+        // Handle specific Firebase errors
+        switch (error.code) {
+          case 'auth/email-already-in-use':
+            setSignUpError('Email already registered. Please login instead');
+            break;
+          case 'auth/invalid-email':
+            setSignUpError('Invalid email address');
+            break;
+          case 'auth/weak-password':
+            setSignUpError('Password is too weak');
+            break;
+          default:
+            setSignUpError('Sign up failed. Please try again');
+        }
+      }
+    } else {
+      // Fallback if Firebase not configured
+      setIsLoading(false);
+      setSignUpError('Firebase not configured. Please check your configuration.');
+    }
   };
 
-  // Placeholder function for Google Sign In
+  // Handle Google Sign In with Firebase
   const handleGoogleSignIn = async () => {
     setIsLoading(true);
     setLoginError('');
     setSignUpError('');
     
+    if (!auth) {
+      setIsLoading(false);
+      setLoginError('Firebase not configured. Please check your configuration.');
+      return;
+    }
+    
     try {
-      // TODO: Replace with actual Google OAuth implementation
-      // Example using Google Identity Services:
-      // const client = google.accounts.oauth2.initTokenClient({
-      //   client_id: 'YOUR_GOOGLE_CLIENT_ID',
-      //   scope: 'email profile',
-      //   callback: async (response) => {
-      //     // Handle the response
-      //     const userInfo = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-      //       headers: { Authorization: `Bearer ${response.access_token}` }
-      //     }).then(r => r.json());
-      //     
-      //     // Send to your backend API
-      //     const apiResponse = await fetch('/api/auth/google', {
-      //       method: 'POST',
-      //       headers: { 'Content-Type': 'application/json' },
-      //       body: JSON.stringify({ token: response.access_token, userInfo })
-      //     });
-      //   }
-      // });
-      // client.requestAccessToken();
+      const provider = new GoogleAuthProvider();
+      const userCredential = await signInWithPopup(auth, provider);
       
-      console.log('Google Sign In - API integration needed');
-      
-      // Simulate API call delay
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
-      // Simulate successful Google login
+      const firebaseUser = userCredential.user;
       setUser({
-        id: 'google_1',
-        name: 'Google User',
-        email: 'user@gmail.com',
+        id: firebaseUser.uid,
+        uid: firebaseUser.uid,
+        name: firebaseUser.displayName || 'User',
+        email: firebaseUser.email,
+        photoURL: firebaseUser.photoURL,
         provider: 'google'
       });
       
@@ -250,69 +608,109 @@ function App() {
       console.log('Google Sign In successful!');
     } catch (error) {
       setIsLoading(false);
-      setLoginError('Google Sign In failed. Please try again.');
       console.error('Google Sign In error:', error);
+      
+      if (error.code === 'auth/popup-closed-by-user') {
+        setLoginError('Sign in cancelled');
+      } else {
+        setLoginError('Google Sign In failed. Please try again.');
+      }
     }
   };
 
-  // Placeholder function for Google Sign Up
+  // Handle Google Sign Up (same as Sign In - Firebase handles both)
   const handleGoogleSignUp = async () => {
-    setIsLoading(true);
-    setLoginError('');
-    
-    try {
-      // TODO: Replace with actual Google OAuth implementation for sign up
-      // Similar to handleGoogleSignIn but with sign up flow
-      console.log('Google Sign Up - API integration needed');
-      
-      // Simulate API call delay
-      await new Promise(resolve => setTimeout(resolve, 1500));
-      
-      // Simulate successful Google sign up
-      setUser({
-        id: 'google_1',
-        name: 'Google User',
-        email: 'user@gmail.com',
-        provider: 'google'
-      });
-      
-      setIsLoading(false);
-      setShowLoginModal(false);
-      setLoginForm({ email: '', password: '' });
-      
-      console.log('Google Sign Up successful!');
-    } catch (error) {
-      setIsLoading(false);
-      setLoginError('Google Sign Up failed. Please try again.');
-      console.error('Google Sign Up error:', error);
-    }
+    // Google Sign Up uses the same flow as Sign In
+    await handleGoogleSignIn();
   };
 
-  // Placeholder function for starting recording
+  // Handle logout
+  const handleLogout = async () => {
+    if (auth && user && !isVolunteer) {
+      try {
+        await signOut(auth);
+      } catch (error) {
+        console.error('Logout error:', error);
+      }
+    }
+    setUser(null);
+    setIsVolunteer(false);
+    stopVoiceActivation();
+  };
+
+  // Listen to Firebase auth state changes
+  useEffect(() => {
+    if (!auth) return;
+
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        // User is signed in
+        setUser({
+          id: firebaseUser.uid,
+          uid: firebaseUser.uid,
+          name: firebaseUser.displayName || 'User',
+          email: firebaseUser.email,
+          photoURL: firebaseUser.photoURL,
+          isVolunteer: false
+        });
+      } else {
+        // User is signed out
+        if (!isVolunteer) {
+          setUser(null);
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, [auth, isVolunteer]);
+
+  // Toggle voice activation / recording
   const startRecording = () => {
     if (isRecording) {
-      // Stop recording
+      // Stop recording if active
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
       setIsRecording(false);
-      console.log('Recording stopped - API integration needed');
-      // TODO: Implement actual recording stop logic
-      // Example: await stopRecordingAPI();
+      setRecordingStatus('idle');
+    } else if (isListening) {
+      // Stop listening and start manual recording
+      stopVoiceActivation();
+      startRecordingWithSilenceDetection();
     } else {
-      // Start recording
-      setIsRecording(true);
-      console.log('Recording started - API integration needed');
-      // TODO: Implement actual recording start logic
-      // Example: await startRecordingAPI();
-      
-      // Simulate 8-second recording session
-      setTimeout(() => {
-        setIsRecording(false);
-        console.log('Recording completed (8 seconds) - API integration needed');
-        // TODO: Process and send recording to API
-        // Example: await processRecordingAPI();
-        alert('Recording completed! (This is a placeholder)');
-      }, 8000);
+      // Start voice activation (listening for "Help me")
+      initializeGeminiVoiceActivation();
     }
   };
+
+  // Initialize voice activation when user logs in (non-volunteer)
+  useEffect(() => {
+    if (user && !isVolunteer && !isListening && recordingStatus === 'idle') {
+      // Auto-start voice activation for regular users
+      initializeGeminiVoiceActivation();
+    }
+
+    // Cleanup on unmount
+    return () => {
+      stopVoiceActivation();
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+    };
+  }, [user, isVolunteer]);
+
+  // Show volunteer dashboard if volunteer is logged in
+  if (isVolunteer && user) {
+    return (
+      <VolunteerDashboard 
+        volunteer={user} 
+        onLogout={handleLogout} 
+      />
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-white">
@@ -525,7 +923,7 @@ function App() {
                 <User className="h-5 w-5 text-cyan-400" />
                 <span className="text-sm sm:text-base text-cyan-400 font-medium">{user.email}</span>
                 <button
-                  onClick={() => setUser(null)}
+                  onClick={handleLogout}
                   className="px-3 py-1.5 text-sm bg-slate-800 hover:bg-slate-700 text-gray-300 rounded-lg transition-colors"
                 >
                   Logout
@@ -566,9 +964,21 @@ function App() {
           {/* Animated Background Effect */}
           <div className="absolute inset-0 flex items-center justify-center">
             {/* Pulsing Rings */}
-            <div className={`absolute w-64 h-64 sm:w-80 sm:h-80 lg:w-96 lg:h-96 rounded-full border-4 ${isRecording ? 'border-cyan-400 pulse-ring active' : 'border-cyan-500/30 pulse-ring'}`}></div>
-            <div className={`absolute w-48 h-48 sm:w-64 sm:h-64 lg:w-80 lg:h-80 rounded-full border-4 ${isRecording ? 'border-blue-400 pulse-ring active' : 'border-blue-500/20 pulse-ring'}`} style={{ animationDelay: '0.5s' }}></div>
-            <div className={`absolute w-32 h-32 sm:w-48 sm:h-48 lg:w-64 lg:h-64 rounded-full border-4 ${isRecording ? 'border-cyan-300 pulse-ring active' : 'border-cyan-500/10 pulse-ring'}`} style={{ animationDelay: '1s' }}></div>
+            <div className={`absolute w-64 h-64 sm:w-80 sm:h-80 lg:w-96 lg:h-96 rounded-full border-4 ${
+              isRecording ? 'border-cyan-400 pulse-ring active' 
+              : isListening ? 'border-yellow-400 pulse-ring active' 
+              : 'border-cyan-500/30 pulse-ring'
+            }`}></div>
+            <div className={`absolute w-48 h-48 sm:w-64 sm:h-64 lg:w-80 lg:h-80 rounded-full border-4 ${
+              isRecording ? 'border-blue-400 pulse-ring active' 
+              : isListening ? 'border-orange-400 pulse-ring active' 
+              : 'border-blue-500/20 pulse-ring'
+            }`} style={{ animationDelay: '0.5s' }}></div>
+            <div className={`absolute w-32 h-32 sm:w-48 sm:h-48 lg:w-64 lg:h-64 rounded-full border-4 ${
+              isRecording ? 'border-cyan-300 pulse-ring active' 
+              : isListening ? 'border-yellow-300 pulse-ring active' 
+              : 'border-cyan-500/10 pulse-ring'
+            }`} style={{ animationDelay: '1s' }}></div>
             
             {/* Audio Wave Visualization (shown when recording) */}
             {isRecording && (
@@ -582,7 +992,11 @@ function App() {
             )}
             
             {/* Central Dot */}
-            <div className={`absolute w-4 h-4 sm:w-6 sm:h-6 bg-cyan-400 rounded-full ${isRecording ? 'pulse-dot active' : 'pulse-dot'}`}></div>
+            <div className={`absolute w-4 h-4 sm:w-6 sm:h-6 rounded-full ${
+              isRecording ? 'bg-cyan-400 pulse-dot active' 
+              : isListening ? 'bg-yellow-400 pulse-dot active' 
+              : 'bg-cyan-400 pulse-dot'
+            }`}></div>
           </div>
 
           {/* Hero Content */}
@@ -634,6 +1048,8 @@ function App() {
                 className={`group relative px-8 py-4 sm:px-12 sm:py-6 md:px-16 md:py-8 rounded-2xl font-bold text-lg sm:text-xl md:text-2xl transition-all duration-300 transform hover:scale-105 ${
                   isRecording
                     ? 'bg-gradient-to-r from-red-500 to-red-600 hover:from-red-400 hover:to-red-500 text-white shadow-2xl shadow-red-500/50'
+                    : isListening
+                    ? 'bg-gradient-to-r from-yellow-500 to-orange-600 hover:from-yellow-400 hover:to-orange-500 text-white shadow-2xl shadow-yellow-500/50'
                     : 'bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white shadow-2xl shadow-cyan-500/50 hover:shadow-cyan-400/70'
                 }`}
               >
@@ -643,10 +1059,15 @@ function App() {
                       <MicOff className="h-6 w-6 sm:h-8 sm:w-8 md:h-10 md:w-10 animate-pulse" />
                       <span>Stop Recording</span>
                     </>
+                  ) : isListening ? (
+                    <>
+                      <Mic className="h-6 w-6 sm:h-8 sm:w-8 md:h-10 md:w-10 animate-pulse" />
+                      <span>Listening for "Help me"...</span>
+                    </>
                   ) : (
                     <>
                       <Mic className="h-6 w-6 sm:h-8 sm:w-8 md:h-10 md:w-10 group-hover:scale-110 transition-transform" />
-                      <span>Start Recording</span>
+                      <span>Start Voice Activation</span>
                     </>
                   )}
                 </div>
@@ -654,8 +1075,18 @@ function App() {
               
               {isRecording && (
                 <p className="mt-4 text-sm sm:text-base text-cyan-400 animate-pulse">
-                  Recording in progress... (8 seconds)
+                  Recording in progress... (Auto-stops after 15s silence or 30s max)
                 </p>
+              )}
+              {isListening && !isRecording && (
+                <div className="mt-4">
+                  <p className="text-sm sm:text-base text-yellow-400 animate-pulse">
+                    Listening for trigger phrases...
+                  </p>
+                  <p className="text-xs sm:text-sm text-gray-400 mt-2">
+                    Say: {API_CONFIG.TRIGGER_PHRASES.join(', ')}
+                  </p>
+                </div>
               )}
             </div>
           </div>
@@ -944,7 +1375,6 @@ function App() {
               </button>
             </form>
             ) : (
-            /* Sign Up Form */
             <form onSubmit={handleSignUp} className="space-y-4">
               {/* Email Field */}
               <div>
